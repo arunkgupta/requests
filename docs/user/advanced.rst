@@ -12,7 +12,10 @@ Session Objects
 
 The Session object allows you to persist certain parameters across
 requests. It also persists cookies across all requests made from the
-Session instance.
+Session instance, and will use ``urllib3``'s `connection pooling`_. So if
+you're making several requests to the same host, the underlying TCP
+connection will be reused, which can result in a significant performance
+increase (see `HTTP persistent connection`_).
 
 A Session object has all the methods of the main Requests API.
 
@@ -21,7 +24,7 @@ Let's persist some cookies across requests::
     s = requests.Session()
 
     s.get('http://httpbin.org/cookies/set/sessioncookie/123456789')
-    r = s.get("http://httpbin.org/cookies")
+    r = s.get('http://httpbin.org/cookies')
 
     print(r.text)
     # '{"cookies": {"sessioncookie": "123456789"}}'
@@ -41,6 +44,34 @@ is done by providing data to the properties on a Session object::
 Any dictionaries that you pass to a request method will be merged with the
 session-level values that are set. The method-level parameters override session
 parameters.
+
+Note, however, that method-level parameters will *not* be persisted across
+requests, even if using a session. This example will only send the cookies
+with the first request, but not the second::
+
+    s = requests.Session()
+
+    r = s.get('http://httpbin.org/cookies', cookies={'from-my': 'browser'})
+    print(r.text)
+    # '{"cookies": {"from-my": "browser"}}'
+
+    r = s.get('http://httpbin.org/cookies')
+    print(r.text)
+    # '{"cookies": {}}'
+
+
+If you want to manually add cookies to your session, use the
+:ref:`Cookie utility functions <api-cookies>` to manipulate
+:attr:`Session.cookies <requests.Session.cookies>`.
+
+Sessions can also be used as context managers::
+
+    with requests.Session() as s:
+        s.get('http://httpbin.org/cookies/set/sessioncookie/123456789')
+
+This will make sure the session is closed as soon as the ``with`` block is
+exited, even if unhandled exceptions occurred.
+
 
 .. admonition:: Remove a Value From a Dict Parameter
 
@@ -99,14 +130,15 @@ request. The simple recipe for this is the following::
     from requests import Request, Session
 
     s = Session()
-    req = Request('GET', url,
-        data=data,
-        headers=header
-    )
+
+    req = Request('POST', url, data=data, headers=headers)
     prepped = req.prepare()
 
     # do something with prepped.body
+    prepped.body = 'No, I want exactly this as the body.'
+
     # do something with prepped.headers
+    del prepped.headers['Content-Type']
 
     resp = s.send(prepped,
         stream=stream,
@@ -135,15 +167,15 @@ applied, replace the call to :meth:`Request.prepare()
     from requests import Request, Session
 
     s = Session()
-    req = Request('GET',  url,
-        data=data
-        headers=headers
-    )
+    req = Request('GET',  url, data=data, headers=headers)
 
     prepped = s.prepare_request(req)
 
     # do something with prepped.body
+    prepped.body = 'Seriously, send exactly these bytes.'
+
     # do something with prepped.headers
+    prepped.headers['Keep-Dead'] = 'parrot'
 
     resp = s.send(prepped,
         stream=stream,
@@ -160,18 +192,23 @@ applied, replace the call to :meth:`Request.prepare()
 SSL Cert Verification
 ---------------------
 
-Requests can verify SSL certificates for HTTPS requests, just like a web browser.
-To check a host's SSL certificate, you can use the ``verify`` argument::
+Requests verifies SSL certificates for HTTPS requests, just like a web browser.
+By default, SSL verification is enabled, and requests will throw a SSLError if
+it's unable to verify the certificate::
 
-    >>> requests.get('https://kennethreitz.com', verify=True)
-    requests.exceptions.SSLError: hostname 'kennethreitz.com' doesn't match either of '*.herokuapp.com', 'herokuapp.com'
+    >>> requests.get('https://requestb.in')
+    requests.exceptions.SSLError: hostname 'requestb.in' doesn't match either of '*.herokuapp.com', 'herokuapp.com'
 
-I don't have SSL setup on this domain, so it fails. Excellent. GitHub does though::
+I don't have SSL setup on this domain, so it throws an exception. Excellent. GitHub does though::
 
-    >>> requests.get('https://github.com', verify=True)
+    >>> requests.get('https://github.com')
     <Response [200]>
 
-You can pass ``verify`` the path to a CA_BUNDLE file with certificates of trusted CAs. This list of trusted CAs can also be specified through the ``REQUESTS_CA_BUNDLE`` environment variable.
+You can pass ``verify`` the path to a CA_BUNDLE file or directory with certificates of trusted CAs::
+
+    >>> requests.get('https://github.com', verify='/path/to/certfile')
+
+This list of trusted CAs can also be specified through the ``REQUESTS_CA_BUNDLE`` environment variable.
 
 Requests can also ignore verifying the SSL certificate if you set ``verify`` to False.
 
@@ -186,13 +223,38 @@ You can also specify a local cert to use as client side certificate, as a single
 file (containing the private key and the certificate) or as a tuple of both
 file's path::
 
-    >>> requests.get('https://kennethreitz.com', cert=('/path/server.crt', '/path/key'))
+    >>> requests.get('https://kennethreitz.com', cert=('/path/client.cert', '/path/client.key'))
     <Response [200]>
 
-If you specify a wrong path or an invalid cert::
+If you specify a wrong path or an invalid cert, you'll get a SSLError::
 
-    >>> requests.get('https://kennethreitz.com', cert='/wrong_path/server.pem')
+    >>> requests.get('https://kennethreitz.com', cert='/wrong_path/client.pem')
     SSLError: [Errno 336265225] _ssl.c:347: error:140B0009:SSL routines:SSL_CTX_use_PrivateKey_file:PEM lib
+
+.. warning:: The private key to your local certificate *must* be unencrypted.
+   Currently, requests does not support using encrypted keys.
+
+.. _ca-certificates:
+
+CA Certificates
+---------------
+
+By default Requests bundles a set of root CAs that it trusts, sourced from the
+`Mozilla trust store`_. However, these are only updated once for each Requests
+version. This means that if you pin a Requests version your certificates can
+become extremely out of date.
+
+From Requests version 2.4.0 onwards, Requests will attempt to use certificates
+from `certifi`_ if it is present on the system. This allows for users to update
+their trusted certificates without having to change the code that runs on their
+system.
+
+For the sake of security we recommend upgrading certifi frequently!
+
+.. _HTTP persistent connection: https://en.wikipedia.org/wiki/HTTP_persistent_connection
+.. _connection pooling: https://urllib3.readthedocs.org/en/latest/pools.html
+.. _certifi: http://certifi.io/
+.. _Mozilla trust store: https://hg.mozilla.org/mozilla-central/raw-file/tip/security/nss/lib/ckfw/builtins/certdata.txt
 
 .. _body-content-workflow:
 
@@ -259,6 +321,15 @@ file-like object for your body::
     with open('massive-body', 'rb') as f:
         requests.post('http://some.url/streamed', data=f)
 
+.. warning:: It is strongly recommended that you open files in `binary mode`_.
+             This is because Requests may attempt to provide the
+             ``Content-Length`` header for you, and if it does this value will
+             be set to the number of *bytes* in the file. Errors may occur if
+             you open the file in *text mode*.
+
+.. _binary mode: https://docs.python.org/2/tutorial/inputoutput.html#reading-and-writing-files
+
+
 .. _chunk-encoding:
 
 Chunk-Encoded Requests
@@ -268,12 +339,18 @@ Requests also supports Chunked transfer encoding for outgoing and incoming reque
 To send a chunk-encoded request, simply provide a generator (or any iterator without
 a length) for your body::
 
-
     def gen():
         yield 'hi'
         yield 'there'
 
     requests.post('http://some.url/chunked', data=gen())
+
+For chunked encoded responses, it's best to iterate over the data using
+:meth:`Response.iter_content() <requests.models.Response.iter_content>`. In
+an ideal situation you'll have set ``stream=True`` on the request, in which
+case you can iterate chunk-by-chunk by calling ``iter_content`` with a chunk
+size parameter of ``None``. If you want to set a maximum size of the chunk,
+you can set a chunk size parameter to any integer.
 
 
 .. _multipart:
@@ -282,15 +359,16 @@ POST Multiple Multipart-Encoded Files
 -------------------------------------
 
 You can send multiple files in one request. For example, suppose you want to
-upload image files to an HTML form with a multiple file field 'images':
+upload image files to an HTML form with a multiple file field 'images'::
 
     <input type="file" name="images" multiple="true" required="true"/>
 
-To do that, just set files to a list of tuples of (form_field_name, file_info):
+To do that, just set files to a list of tuples of ``(form_field_name, file_info)``::
 
     >>> url = 'http://httpbin.org/post'
-    >>> multiple_files = [('images', ('foo.png', open('foo.png', 'rb'), 'image/png')),
-                          ('images', ('bar.png', open('bar.png', 'rb'), 'image/png'))]
+    >>> multiple_files = [
+            ('images', ('foo.png', open('foo.png', 'rb'), 'image/png')),
+            ('images', ('bar.png', open('bar.png', 'rb'), 'image/png'))]
     >>> r = requests.post(url, files=multiple_files)
     >>> r.text
     {
@@ -299,6 +377,15 @@ To do that, just set files to a list of tuples of (form_field_name, file_info):
       'Content-Type': 'multipart/form-data; boundary=3131623adb2043caaeb5538cc7aa0b3a',
       ...
     }
+
+.. warning:: It is strongly recommended that you open files in `binary mode`_.
+             This is because Requests may attempt to provide the
+             ``Content-Length`` header for you, and if it does this value will
+             be set to the number of *bytes* in the file. Errors may occur if
+             you open the file in *text mode*.
+
+.. _binary mode: https://docs.python.org/2/tutorial/inputoutput.html#reading-and-writing-files
+
 
 .. _event-hooks:
 
@@ -399,6 +486,21 @@ set ``stream`` to ``True`` and iterate over the response with
         if line:
             print(json.loads(line))
 
+.. warning::
+
+    :class:`~requests.Response.iter_lines()` is not reentrant safe.
+    Calling this method multiple times causes some of the received data
+    being lost. In case you need to call it from multiple places, use
+    the resulting iterator object instead::
+
+        lines = r.iter_lines()
+        # Save the first line for later or just skip it
+
+        first_line = next(lines)
+
+        for line in lines:
+            print(line)
+
 .. _proxies:
 
 Proxies
@@ -410,11 +512,11 @@ If you need to use a proxy, you can configure individual requests with the
     import requests
 
     proxies = {
-      "http": "http://10.10.1.10:3128",
-      "https": "http://10.10.1.10:1080",
+      'http': 'http://10.10.1.10:3128',
+      'https': 'http://10.10.1.10:1080',
     }
 
-    requests.get("http://example.org", proxies=proxies)
+    requests.get('http://example.org', proxies=proxies)
 
 You can also configure proxies by setting the environment variables
 ``HTTP_PROXY`` and ``HTTPS_PROXY``.
@@ -423,17 +525,26 @@ You can also configure proxies by setting the environment variables
 
     $ export HTTP_PROXY="http://10.10.1.10:3128"
     $ export HTTPS_PROXY="http://10.10.1.10:1080"
+
     $ python
     >>> import requests
-    >>> requests.get("http://example.org")
+    >>> requests.get('http://example.org')
 
 To use HTTP Basic Auth with your proxy, use the `http://user:password@host/` syntax::
 
-    proxies = {
-        "http": "http://user:pass@10.10.1.10:3128/",
-    }
+    proxies = {'http': 'http://user:pass@10.10.1.10:3128/'}
+
+To give a proxy for a specific scheme and host, use the
+`scheme://hostname` form for the key.  This will match for
+any request to the given scheme and exact hostname.
+
+::
+
+    proxies = {'http://10.20.1.128': 'http://10.10.1.10:5323'}
 
 Note that proxy URLs must include the scheme.
+
+.. _compliance:
 
 Compliance
 ----------
@@ -460,6 +571,8 @@ that the default charset must be ``ISO-8859-1``. Requests follows the
 specification in this case. If you require a different encoding, you can
 manually set the :attr:`Response.encoding <requests.Response.encoding>`
 property, or use the raw :attr:`Response.content <requests.Response.content>`.
+
+.. _http-verbs:
 
 HTTP Verbs
 ----------
@@ -492,10 +605,13 @@ So, GitHub returns JSON. That's great, we can use the :meth:`r.json
 ::
 
     >>> commit_data = r.json()
+
     >>> print(commit_data.keys())
     [u'committer', u'author', u'url', u'tree', u'sha', u'parents', u'message']
+
     >>> print(commit_data[u'committer'])
     {u'date': u'2012-05-10T11:10:50-07:00', u'email': u'me@kennethreitz.com', u'name': u'Kenneth Reitz'}
+
     >>> print(commit_data[u'message'])
     makin' history
 
@@ -535,9 +651,12 @@ already exists, we will use it as an example. Let's start by getting it.
     >>> r = requests.get('https://api.github.com/repos/kennethreitz/requests/issues/482')
     >>> r.status_code
     200
+
     >>> issue = json.loads(r.text)
+
     >>> print(issue[u'title'])
     Feature any http verb in docs
+
     >>> print(issue[u'comments'])
     3
 
@@ -548,9 +667,12 @@ Cool, we have three comments. Let's take a look at the last of them.
     >>> r = requests.get(r.url + u'/comments')
     >>> r.status_code
     200
+
     >>> comments = r.json()
+
     >>> print(comments[0].keys())
     [u'body', u'url', u'created_at', u'updated_at', u'user', u'id']
+
     >>> print(comments[2][u'body'])
     Probably in the "advanced" section
 
@@ -570,6 +692,7 @@ is to POST to the thread. Let's do it.
 
     >>> body = json.dumps({u"body": u"Sounds great! I'll get right on it!"})
     >>> url = u"https://api.github.com/repos/kennethreitz/requests/issues/482/comments"
+
     >>> r = requests.post(url=url, data=body)
     >>> r.status_code
     404
@@ -582,9 +705,11 @@ the very common Basic Auth.
 
     >>> from requests.auth import HTTPBasicAuth
     >>> auth = HTTPBasicAuth('fake@example.com', 'not_a_real_password')
+
     >>> r = requests.post(url=url, data=body, auth=auth)
     >>> r.status_code
     201
+
     >>> content = r.json()
     >>> print(content[u'body'])
     Sounds great! I'll get right on it.
@@ -598,8 +723,10 @@ that.
 
     >>> print(content[u"id"])
     5804413
+
     >>> body = json.dumps({u"body": u"Sounds great! I'll get right on it once I feed my cat."})
     >>> url = u"https://api.github.com/repos/kennethreitz/requests/issues/comments/5804413"
+
     >>> r = requests.patch(url=url, data=body, auth=auth)
     >>> r.status_code
     200
@@ -634,6 +761,8 @@ headers.
 Excellent. Time to write a Python program that abuses the GitHub API in all
 kinds of exciting ways, 4995 more times.
 
+.. _link-headers:
+
 Link Headers
 ------------
 
@@ -655,6 +784,8 @@ Requests will automatically parse these link headers and make them easily consum
 
     >>> r.links["last"]
     {'url': 'https://api.github.com/users/kennethreitz/repos?page=7&per_page=10', 'rel': 'last'}
+
+.. _transport-adapters:
 
 Transport Adapters
 ------------------
@@ -716,13 +847,14 @@ SSLv3:
         """"Transport adapter" that allows us to use SSLv3."""
 
         def init_poolmanager(self, connections, maxsize, block=False):
-            self.poolmanager = PoolManager(num_pools=connections,
-                                           maxsize=maxsize,
-                                           block=block,
-                                           ssl_version=ssl.PROTOCOL_SSLv3)
+            self.poolmanager = PoolManager(
+                num_pools=connections, maxsize=maxsize,
+                block=block, ssl_version=ssl.PROTOCOL_SSLv3)
 
 .. _`described here`: http://www.kennethreitz.org/essays/the-future-of-python-http
 .. _`urllib3`: https://github.com/shazow/urllib3
+
+.. _blocking-or-nonblocking:
 
 Blocking Or Non-Blocking?
 -------------------------
@@ -740,6 +872,8 @@ Two excellent examples are `grequests`_ and `requests-futures`_.
 
 .. _`grequests`: https://github.com/kennethreitz/grequests
 .. _`requests-futures`: https://github.com/ross/requests-futures
+
+.. _timeouts:
 
 Timeouts
 --------
@@ -778,21 +912,3 @@ coffee.
     r = requests.get('https://github.com', timeout=None)
 
 .. _`connect()`: http://linux.die.net/man/2/connect
-
-CA Certificates
----------------
-
-By default Requests bundles a set of root CAs that it trusts, sourced from the
-`Mozilla trust store`_. However, these are only updated once for each Requests
-version. This means that if you pin a Requests version your certificates can
-become extremely out of date.
-
-From Requests version 2.4.0 onwards, Requests will attempt to use certificates
-from `certifi`_ if it is present on the system. This allows for users to update
-their trusted certificates without having to change the code that runs on their
-system.
-
-For the sake of security we recommend upgrading certifi frequently!
-
-.. _certifi: http://certifi.io/
-.. _Mozilla trust store: https://hg.mozilla.org/mozilla-central/raw-file/tip/security/nss/lib/ckfw/builtins/certdata.txt
